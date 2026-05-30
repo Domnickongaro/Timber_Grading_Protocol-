@@ -2,6 +2,7 @@ import streamlit as st
 import cv2
 import numpy as np
 import os
+import math
 
 st.set_page_config(
     page_title="Timber Quality Assurance Engine",
@@ -24,10 +25,8 @@ IMAGE_DIR = "timber_images"
 # --- SIDEBAR CONTROLS & DUAL INPUT PATHWAY ---
 st.sidebar.header("📥 Specimen Input Stream")
 
-# Feature 1: Upload from any source
 uploaded_file = st.sidebar.file_uploader("Upload External Timber Image:", type=["png", "jpg", "jpeg"])
 
-# Feature 2: Fallback list of baseline samples
 if os.path.exists(IMAGE_DIR):
     image_files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     image_files.sort()
@@ -45,10 +44,9 @@ st.sidebar.subheader("📐 Spatial Scale Factor")
 ppm = st.sidebar.slider("Calibration Factor (Pixels per mm)", min_value=1.0, max_value=25.0, value=6.0, step=0.5)
 
 st.sidebar.subheader("🎛️ Digital Image Processing Tuners")
-knot_sens = st.sidebar.slider("Knot Sensitivity (Lower catches lighter knots)", min_value=30, max_value=150, value=95, step=5)
-crack_sens = st.sidebar.slider("Crack Sensitivity (Lower catches finer splits)", min_value=10, max_value=100, value=40, step=5)
+knot_sens = st.sidebar.slider("Knot Adaptive Block Size", min_value=11, max_value=151, value=51, step=2)
+crack_sens = st.sidebar.slider("Crack Edge Upper Threshold", min_value=30, max_value=200, value=100, step=5)
 
-# --- ENGINE LOADER ---
 def load_input_image():
     if uploaded_file is not None:
         file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
@@ -57,104 +55,125 @@ def load_input_image():
         return cv2.imread(os.path.join(IMAGE_DIR, selected_baseline))
     return None
 
-# --- MULTI-STAGE DEFECT EXTRACTION SYSTEM ---
-def process_wood_physics(img, pixels_per_mm, k_thresh, c_thresh):
+def process_wood_physics(img, pixels_per_mm, knot_block, crack_thresh):
     h_img, w_img, _ = img.shape
-    total_area_pixels = h_img * w_img
-    
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Storage arrays for localized markers
     annotated = img.copy()
+    
+    # 1. ENHANCED PREPROCESSING (Normalize lighting via CLAHE)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    enhanced_gray = clahe.apply(gray)
+    blurred = cv2.GaussianBlur(enhanced_gray, (5, 5), 0)
+    
     max_knot_dia = 0.0
     max_crack_len = 0.0
     wane_detected = False
     wane_extent_pct = 0.0
+
+    # -------------------------------------------------------------------------
+    # STAGE 1: ADAPTIVE KNOT ISOLATION & CIRCULARITY FILTERING
+    # -------------------------------------------------------------------------
+    # Dynamic thresholding adjusts to localized dark wood spots
+    knot_mask = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+        cv2.THRESH_BINARY_INV, knot_block, 15
+    )
     
-    # -------------------------------------------------------------------------
-    # STAGE 1: DENSE KNOT ISOLATION (Using targeted dual-threshold mask)
-    # -------------------------------------------------------------------------
-    _, knot_mask = cv2.threshold(blurred, k_thresh, 255, cv2.THRESH_BINARY_INV)
-    # Clean grain noise using structural opening
-    k_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Clean grain noise using structural morphology
+    k_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     knot_mask = cv2.morphologyEx(knot_mask, cv2.MORPH_OPEN, k_kernel)
     
     k_contours, _ = cv2.findContours(knot_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in k_contours:
         area = cv2.contourArea(cnt)
-        if area > (8 * pixels_per_mm * 8 * pixels_per_mm):  # Filter out minor artifacts
-            x, y, w, h = cv2.boundingRect(cnt)
-            # Ensure it is an inner defect, not edge wane cutting into the board
-            if (x > 20 and y > 20 and (x+w) < (w_img-20) and (y+h) < (h_img-20)):
-                dia_mm = max(w, h) / pixels_per_mm
+        perimeter = cv2.arcLength(cnt, True)
+        
+        if perimeter == 0: continue
+        circularity = (4 * math.pi * area) / (perimeter ** 2)
+        
+        # Knots are typically compact/circular, grain elements are elongated lines
+        if area > (15 * pixels_per_mm) and circularity > 0.25:
+            (x, y), radius = cv2.minEnclosingCircle(cnt)
+            center = (int(x), int(y))
+            radius = int(radius)
+            
+            # Bound check: Ensure it's inside the timber surface, not edge artifacts
+            if (20 < center[0] < w_img - 20) and (20 < center[1] < h_img - 20):
+                dia_mm = (radius * 2) / pixels_per_mm
                 if dia_mm > max_knot_dia:
                     max_knot_dia = dia_mm
-                cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                cv2.putText(annotated, f"Knot: {dia_mm:.1f}mm", (x, y - 8), 
+                
+                cv2.circle(annotated, center, radius, (0, 0, 255), 2)
+                cv2.putText(annotated, f"Knot: {dia_mm:.1f}mm", (center[0] - radius, center[1] - radius - 8), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
     # -------------------------------------------------------------------------
-    # STAGE 2: LINEAR CRACK/SPLIT TRACKING (Using directional gradient profile)
+    # STAGE 2: ROTATED BOUNDING CRACK COMPREHENSION
     # -------------------------------------------------------------------------
-    # Pull directional high frequencies (Sobel vertical + horizontal derivatives)
-    grad_x = cv2.Sobel(blurred, cv2.CV_16S, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(blurred, cv2.CV_16S, 0, 1, ksize=3)
-    abs_grad_x = cv2.convertScaleAbs(grad_x)
-    abs_grad_y = cv2.convertScaleAbs(grad_y)
-    edges = cv2.addWeighted(abs_grad_x, 0.5, abs_grad_y, 0.5, 0)
+    # Highlighting crisp fine fissure lines via bilateral-filtered Canny extraction
+    crack_blur = cv2.bilateralFilter(enhanced_gray, 9, 75, 75)
+    edges = cv2.Canny(crack_blur, int(crack_thresh * 0.4), crack_thresh)
     
-    _, crack_mask = cv2.threshold(edges, c_thresh, 255, cv2.THRESH_BINARY)
-    # Re-link discontinuous linear fissures using an elongated structural element
-    c_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
-    crack_mask = cv2.morphologyEx(crack_mask, cv2.MORPH_CLOSE, c_kernel)
+    # Merge tiny breaks along crack fractures
+    c_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 3))
+    crack_mask = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, c_kernel)
     
     c_contours, _ = cv2.findContours(crack_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for cnt in c_contours:
-        perimeter = cv2.arcLength(cnt, True)
-        x, y, w, h = cv2.boundingRect(cnt)
-        # Structural check: cracks are highly elongated features
-        aspect_ratio = max(w, h) / (min(w, h) + 0.001)
-        if perimeter > 40 and aspect_ratio > 3.0:
-            length_mm = max(w, h) / pixels_per_mm
-            if length_mm > max_crack_len:
-                max_crack_len = length_mm
-            cv2.rectangle(annotated, (x, y), (x + w, y + h), (255, 140, 0), 2)
-            cv2.putText(annotated, f"Split: {length_mm:.1f}mm", (x, y - 8), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 140, 0), 1)
+        if cv2.contourArea(cnt) > 10:
+            # Fit an oriented bounding box instead of a regular box to trace diagonal fissures
+            rect = cv2.minAreaRect(cnt)
+            (cx, cy), (w_box, h_box), angle = rect
+            box_len = max(w_box, h_box)
+            box_wid = min(w_box, h_box) + 0.001
+            
+            if box_len > 15 and (box_len / box_wid) > 4.0:
+                length_mm = box_len / pixels_per_mm
+                if length_mm > max_crack_len:
+                    max_crack_len = length_mm
+                
+                box = cv2.boxPoints(rect)
+                box = np.intp(box)
+                cv2.drawContours(annotated, [box], 0, (255, 140, 0), 2)
+                cv2.putText(annotated, f"Split: {length_mm:.1f}mm", (int(cx), int(cy) - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 140, 0), 1)
 
     # -------------------------------------------------------------------------
-    # STAGE 3: WANE DEFICIT ISOLATION (Using Convex Hull edge mapping)
+    # STAGE 3: OTSU-DRIVEN BOARD SEGMENTATION & WANE DEFICIT
     # -------------------------------------------------------------------------
-    _, board_mask = cv2.threshold(blurred, 40, 255, cv2.THRESH_BINARY)
+    # Automatic Otsu segmentation handles light variations across backgrounds seamlessly
+    _, board_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Close any internal holes inside the wood board
+    b_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    board_mask = cv2.morphologyEx(board_mask, cv2.MORPH_CLOSE, b_kernel)
+    
     b_contours, _ = cv2.findContours(board_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     if b_contours:
         largest_cnt = max(b_contours, key=cv2.contourArea)
         hull = cv2.convexHull(largest_cnt)
         
-        # Calculate the geometric difference between structural hull and real timber perimeter
         hull_area = cv2.contourArea(hull)
         real_area = cv2.contourArea(largest_cnt)
-        deficit_area = hull_area - real_area
         
-        # Track edge intrusion coordinates
-        x, y, w, h = cv2.boundingRect(largest_cnt)
-        edge_buffer = 30
-        
-        if deficit_area > (50 * pixels_per_mm * pixels_per_mm):
-            # Verify if this convexity deficit touches physical boundaries
-            wane_detected = True
-            wane_extent_pct = (deficit_area / hull_area) * 100
-            
-            # Map out exactly where the geometric missing boundary sits
-            cv2.drawContours(annotated, [largest_cnt], -1, (255, 0, 255), 1)
-            if wane_extent_pct > 0.5:
-                cv2.putText(annotated, f"Wane Region: Deficit {wane_extent_pct:.1f}%", (x + 40, y + 40), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+        if hull_area > 0:
+            deficit_area = hull_area - real_area
+            # Check if geometric loss breaches threshold boundaries
+            if deficit_area > (30 * pixels_per_mm * pixels_per_mm):
+                wane_detected = True
+                wane_extent_pct = (deficit_area / hull_area) * 100
+                
+                cv2.drawContours(annotated, [largest_cnt], -1, (255, 0, 255), 1)
+                # Draw the missing structural edge area profile
+                cv2.drawContours(annotated, [hull], -1, (0, 255, 255), 1)
+                
+                if wane_extent_pct > 0.5:
+                    cv2.putText(annotated, f"Wane Region: Deficit {wane_extent_pct:.1f}%", (50, 50), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 
     # -------------------------------------------------------------------------
-    # STAGE 4: DETERMINISTIC WOOD TECHNOLOGY CRADING RESOLUTION MATRIX
+    # STAGE 4: DETERMINISTIC WOOD TECHNOLOGY GRADING RESOLUTION MATRIX
     # -------------------------------------------------------------------------
     if max_knot_dia < 10.0 and max_crack_len == 0.0 and not wane_detected:
         assigned_grade = "Clear / Grade A"
@@ -200,7 +219,6 @@ if raw_img is not None:
         raw_img, ppm, knot_sens, crack_sens
     )
     
-    # Layout rendering panels
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Raw Timber Inspection View**")
@@ -211,7 +229,6 @@ if raw_img is not None:
         
     st.divider()
     
-    # Metric Parameter Deck
     st.markdown("### 📊 Extracted Morphological Metrics (Wood Science Logging)")
     m1, m2, m3, m4 = st.columns(4)
     with m1:
