@@ -9,23 +9,18 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom styling for a clean engineering interface
 st.markdown("""
     <style>
-    .metric-card {background-color: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 5px solid #4CAF50;}
-    .reason-box {background-color: #f1f3f5; padding: 20px; border-radius: 8px; font-style: italic;}
+    .metric-card {background-color: #f8f9fa; padding: 15px; border-radius: 10px; border-left: 5px solid #2E7D32;}
+    .reason-box {background-color: #f1f3f5; padding: 20px; border-radius: 8px; font-family: monospace;}
     </style>
 """, unsafe_allow_html=True)
 
-st.title("🪵 Predictive Surface Defect Assessment Protocol")
-st.write("Automated visual inspection framework for quality assurance and structural timber grading.")
-
-# --- SIDEBAR CONTROL WORKSTATION ---
-st.sidebar.header("📋 Workstation Controls")
+st.title("🔬 Predictive Surface Defect Assessment Protocol")
+st.write("Quantitative structural grading engine based on standard wood technology metrics.")
 
 IMAGE_DIR = "timber_images"
 
-# Load and sort the 24 sample images
 if os.path.exists(IMAGE_DIR):
     image_files = [f for f in os.listdir(IMAGE_DIR) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     image_files.sort()
@@ -33,122 +28,159 @@ else:
     image_files = []
 
 if not image_files:
-    st.sidebar.error(f"No sample images found in '{IMAGE_DIR}'. Please check your repository configuration.")
+    st.error("No sample images found in storage.")
     st.stop()
 
-# Dropdown selector to pick exactly 1 timber sample at a time
-selected_file = st.sidebar.selectbox(
-    "Queue Active Board Select:",
-    options=image_files,
-    index=0
-)
+# --- SIDEBAR CONTROL CONTROL ---
+st.sidebar.header("⚙️ Calibration Workspace")
+selected_file = st.sidebar.selectbox("Select Active Specimen:", options=image_files)
 image_path = os.path.join(IMAGE_DIR, selected_file)
 
-# Dynamic tuning controls for the computer vision logic
-st.sidebar.subheader("🔧 Spatiotemporal Calibration")
-intensity_offset = st.sidebar.slider(
-    "Contrast Sensitivity (Adaptive Threshold)", 
-    min_value=3, max_value=25, value=11, step=2,
-    help="Higher values isolate severe defects; lower values capture subtle grain variations."
-)
-min_defect_area = st.sidebar.slider(
-    "Minimum Defect Area (Pixels)", 
-    min_value=50, max_value=5000, value=300, step=50,
-    help="Filter threshold to separate negligible wood grain texture from actual defects."
-)
+st.sidebar.subheader("📐 Spatial Scale Factor")
+# Adjust this to match your real camera setup (how many pixels span 1 mm)
+pixels_per_mm = st.sidebar.slider("Calibration Factor (Pixels per mm)", min_value=1.0, max_value=20.0, value=5.0, step=0.5)
 
-# --- IMAGE PROCESSING AND FEATURE EXTRACTION PIPELINE ---
-@st.cache_data(show_spinner=False)
-def process_timber_face(path, offset, min_area):
-    # Read image in raw BGR format
+st.sidebar.subheader("🎛️ Segmentation Sensitivity")
+adaptive_block = st.sidebar.slider("Adaptive Neighborhood Window", min_value=11, max_value=99, value=31, step=2)
+intensity_offset = st.sidebar.slider("Contrast Offset (Sensitivity)", min_value=2, max_value=20, value=7, step=1)
+
+# --- COMPUTER VISION EXTRACTION ENGINE ---
+def analyze_timber_anomalies(path, ppm, block_size, offset):
     img = cv2.imread(path)
     if img is None:
-        return None, None, 0, 0, "Error loading image file."
-
-    # 1. Image Preprocessing & Spatial Smoothing
+        return None, None, {}, "Error reading specimen."
+        
+    h_img, w_img, _ = img.shape
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    # 2. Adaptive Binarization (Handles uneven lighting across the 24 samples)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Advanced Adaptive Thresholding to extract low-contrast defects
     thresh = cv2.adaptiveThreshold(
-        blurred, 255, 
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY_INV, 21, offset
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, block_size, offset
     )
-
-    # 3. Geometric Feature Extraction
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    annotated_img = img.copy()
-    defect_count = 0
-    max_defect_size = 0
-
+    
+    # Morphological closing to join fragmented splits/cracks
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    annotated = img.copy()
+    
+    # Metrics tracking structures
+    max_knot_dia = 0.0
+    max_crack_len = 0.0
+    wane_detected = False
+    wane_extent_pct = 0.0
+    
     for cnt in contours:
-        area = cv2.contourArea(cnt)
+        area_pixels = cv2.contourArea(cnt)
+        if area_pixels < (5 * ppm * 5 * ppm): # Filter out insignificant background grain noise (<25mm²)
+            continue
+            
+        x, y, w, h = cv2.boundingRect(cnt)
+        
+        # Physical metric conversions
+        w_mm = w / ppm
+        h_mm = h / ppm
+        perimeter_pixels = cv2.arcLength(cnt, True)
+        
+        # 1. Wane Extraction (Anomalies hugging the outer physical edge of the board)
+        edge_buffer = 15 # pixels from edge
+        is_touching_edge = (x < edge_buffer or y < edge_buffer or 
+                             (x + w) > (w_img - edge_buffer) or 
+                             (y + h) > (h_img - edge_buffer))
+        
+        # 2. Shape Factor Analysis (Circular vs Linear)
+        # Circularity formula: 4 * pi * Area / Perimeter^2
+        circularity = (4 * np.pi * area_pixels) / (perimeter_pixels ** 2) if perimeter_pixels > 0 else 0
+        
+        # Classify based on geometric aspect ratio and position
+        if is_touching_edge and circularity < 0.4:
+            wane_detected = True
+            wane_extent_pct = max(wane_extent_pct, (w / w_img) * 100)
+            label = f"Wane: Ext {wane_extent_pct:.1f}%"
+            color = (255, 0, 255) # Pink
+        elif circularity < 0.25 or (max(w_mm, h_mm) / (min(w_mm, h_mm) + 0.01) > 4.0):
+            # Long, thin linear shape = Check for split/crack length
+            crack_length = max(w_mm, h_mm)
+            if crack_length > max_crack_len:
+                max_crack_len = crack_length
+            label = f"Crack: {crack_length:.1f}mm"
+            color = (255, 165, 0) # Orange
+        else:
+            # Rounder shape = Sound or Loose Knot cluster
+            knot_diameter = max(w_mm, h_mm)
+            if knot_diameter > max_knot_dia:
+                max_knot_dia = knot_diameter
+            label = f"Knot: D={knot_diameter:.1f}mm"
+            color = (0, 0, 255) # Red
+            
+        # Draw bounding boxes and physical measurements
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
+        cv2.putText(annotated, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Apply the filter size constraint
-        if area > min_area:
-            defect_count += 1
-            if area > max_defect_size:
-                max_defect_size = area
-
-            # Extract bounding boxes for localization metrics
-            x, y, w, h = cv2.boundingRect(cnt)
-
-            # Label detected nodes/defects visually
-            cv2.rectangle(annotated_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
-            cv2.putText(
-                annotated_img, f"ID:{defect_count} ({int(area)}px)", 
-                (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1
-            )
-
-    # 4. Deterministic Rule-Based Grading Engine
-    if defect_count == 0:
-        grade = "Grade A (Premium / Clear)"
-        reason = "The structural assessment detected zero surface anomalies or density deviations exceeding the minimum tolerance threshold."
-    elif max_defect_size < 1500:
-        grade = "Grade B (Select / Structural)"
-        reason = f"Assigned to Grade B due to minor structural anomalies. System extracted {defect_count} anomalous feature(s), with the peak localized defect area measuring {int(max_defect_size)} square pixels—remaining within allowable thresholds for load-bearing timber."
+    # --- DETERMINISTIC STRUCTURAL WOOD TECHNOLOGY GRADING LOGIC ---
+    if max_knot_dia < 10.0 and max_crack_len == 0.0 and not wane_detected:
+        assigned_grade = "Clear / Grade A"
+        reason = (f"Specimen complies fully with Grade A structural criteria. "
+                  f"Maximum detected knot diameter ({max_knot_dia:.2f} mm) is safely below the 10 mm restriction. "
+                  f"No linear macro-fractures (cracks) or wane anomalies were localized across the face plane.")
+                  
+    elif max_knot_dia <= 30.0 and max_crack_len < 50.0 and (wane_extent_pct < 8.0):
+        assigned_grade = "Select / Grade B"
+        reason = (f"Specimen assigned to Grade B (Select structural classification). "
+                  f"Analysis observed limited macro-anomalies: Peak knot diameter is {max_knot_dia:.2f} mm "
+                  f"(allowable range: 10-30 mm), maximum split trajectory extension measures {max_crack_len:.2f} mm "
+                  f"(allowable constraint: <50 mm), and detected wane profiles remain minor at {wane_extent_pct:.1f}% boundary impact.")
+                  
     else:
-        grade = "Grade C (Utility / Common)"
-        reason = f"Downgraded to Grade C due to major localized structural deviations. Feature ID verification caught a severe anomaly spanning {int(max_defect_size)} square pixels, violating the structural integrity tolerances required for premium certification."
+        assigned_grade = "Common / Grade C"
+        triggers = []
+        if max_knot_dia > 30.0: triggers.append(f"Knot size ({max_knot_dia:.2f} mm) exceeds the 30 mm critical threshold")
+        if max_crack_len >= 50.0: triggers.append(f"Structural split length ({max_crack_len:.2f} mm) violates the 50 mm constraint")
+        if wane_detected and wane_extent_pct >= 8.0: triggers.append(f"Significant wane profile localized at {wane_extent_pct:.1f}% extension")
+        
+        reason = f"Specimen downgraded to Grade C (Common/Utility grading). Disqualifying structural triggers: {'; '.join(triggers)}."
 
-    return img, annotated_img, defect_count, max_defect_size, grade, reason
+    extracted_metrics = {
+        "max_knot": max_knot_dia,
+        "max_crack": max_crack_len,
+        "wane_present": "Yes" if wane_detected else "No",
+        "wane_pct": wane_extent_pct
+    }
+    
+    return img, annotated, extracted_metrics, assigned_grade, reason
 
-# Execute the processing pipeline
-raw_img, processed_img, count, max_size, quality_grade, explanation = process_timber_face(
-    image_path, intensity_offset, min_defect_area
+# Execute Engine Pipeline
+raw_img, processed_img, metrics, grade, explanation = analyze_timber_anomalies(
+    image_path, pixels_per_mm, adaptive_block, intensity_offset
 )
 
-# --- USER INTERFACE DISPLAY LAYOUT ---
+# --- USER INTERFACE LAYOUT ---
 if raw_img is not None:
-    st.subheader(f"Active Inspection Unit: `{selected_file}`")
-
-    # Side-by-side comparative inspection display
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("**Original Timber Input View**")
+        st.markdown("**Original Inspection View**")
         st.image(cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB), use_container_width=True)
     with col2:
-        st.markdown("**Automated Feature Segmentation Overlay**")
+        st.markdown("**Morphological Feature Classification Overlay**")
         st.image(cv2.cvtColor(processed_img, cv2.COLOR_BGR2RGB), use_container_width=True)
-
+        
     st.divider()
-
-    # Metrics Panel
-    st.markdown("### 📊 Automated Inspection Metrics")
-    m_col1, m_col2, m_col3 = st.columns(3)
-
-    with m_col1:
-        st.metric(label="Assigned Quality Classification", value=quality_grade.split(" (")[0])
-    with m_col2:
-        st.metric(label="Total Distinct Surface Defects", value=f"{count} Detected")
-    with m_col3:
-        st.metric(label="Critical Defect Footprint", value=f"{int(max_size)} px²")
-
-    # Decision Reasoning Breakdown Output
-    st.markdown("### 🧠 Grading Decision Breakdown")
-    st.markdown(f"<div class='reason-box'><strong>System Evaluation Note:</strong> {explanation}</div>", unsafe_allow_html=True)
-
-else:
-    st.error("Error running processing protocol on selected image stream.")
+    
+    # Quantitative Dashboard
+    st.markdown("### 📊 Extracted Morphological Metrics")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric(label="Assigned Quality Grade", value=grade)
+    with m2:
+        st.metric(label="Max Knot Diameter", value=f"{metrics['max_knot']:.1f} mm")
+    with m3:
+        st.metric(label="Max Crack/Split Length", value=f"{metrics['max_crack']:.1f} mm")
+    with m4:
+        st.metric(label="Edge Wane Profile Detected?", value=f"{metrics['wane_present']} ({metrics['wane_pct']:.1f}%)")
+        
+    st.markdown("### 🧠 Grading Decision Breakdown (Wood Technology Log)")
+    st.markdown(f"<div class='reason-box'><strong>[RESOLUTION METRIC ENGINE LOG]:</strong> {explanation}</div>", unsafe_allow_html=True)
