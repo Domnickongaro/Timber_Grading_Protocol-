@@ -1,0 +1,11 @@
+# Ignore python cache files
+__pycache__/
+*.pyc
+
+# Ignore OS specific files
+.DS_Store
+Thumbs.db
+
+# Optional: If your 24 timber images are very high resolution/large,
+# uncomment the line below to keep your GitHub history clean.
+# timber_images/
