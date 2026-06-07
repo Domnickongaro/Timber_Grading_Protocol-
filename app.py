@@ -185,6 +185,7 @@ Knot: {max_knot:.2f} mm
 Crack: {max_crack:.2f} mm
 Wane: {wane_pct:.2f} %
 Classification: {grade}
+CONFIANCE GRADING FRAMEWORKS:
 """
 
     return img, annotated, metrics, grade, explanation
