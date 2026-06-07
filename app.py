@@ -216,4 +216,3 @@ if img is not None:
 
 else:
     st.info("Upload an image to begin.")
-``
