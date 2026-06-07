@@ -5,12 +5,11 @@ import os
 from skimage.filters import frangi
 
 st.set_page_config(
-    page_title="Timber Quality Assurance Engine (Enhanced)",
-    page_icon="🪵",
+    page_title="Timber Grading Application(Confiance V1)",
     layout="wide"
 )
 
-st.title("🔬 Enhanced Timber Defect Detection (Hybrid CV)")
+st.title("Timber Grading Protocol")
 
 IMAGE_DIR = "timber_images"
 
